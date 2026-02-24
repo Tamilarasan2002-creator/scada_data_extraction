@@ -22,3 +22,17 @@ class SCADAData(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["datetime", "locno"], name="unique_datetime_locno")
         ]
+
+
+class ScadaDataEnercon(models.Model):
+    date = models.DateTimeField()
+    asset_name = models.CharField(max_length=100)
+
+    active_power_generation = models.FloatField(null=True, blank=True)
+    wind_direction_outside_nacelle = models.FloatField(null=True, blank=True)
+    wind_speed_outside_nacelle = models.FloatField(null=True, blank=True)
+    temperature_outside_nacelle = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        db_table = "scada_data_enercon"
+        managed = False   # IMPORTANT (table already exists)

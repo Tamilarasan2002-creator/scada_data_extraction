@@ -10,7 +10,7 @@ class Command(BaseCommand):
 
     help = "Extract SCADA Excel files to Database"
 
-    INPUT_FOLDER = "2026"   # ⚠ Change when needed
+    INPUT_FOLDER = "2022"   # ⚠ Change when needed
 
     def add_arguments(self, parser):
         parser.add_argument(

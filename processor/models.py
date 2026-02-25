@@ -36,3 +36,26 @@ class ScadaDataEnercon(models.Model):
     class Meta:
         db_table = "scada_data_enercon"
         managed = False   # IMPORTANT (table already exists)
+
+
+
+
+    
+# class GTMW(models.Model):
+#     device = models.CharField(max_length=100)
+#     date = models.DateTimeField()
+
+#     misalignment_percent = models.FloatField(null=True, blank=True)
+#     avg_active_power = models.FloatField(null=True, blank=True)
+#     avg_ambient_temperature = models.FloatField(null=True, blank=True)
+#     avg_wind_speed = models.FloatField(null=True, blank=True)
+
+#     class Meta:
+#         db_table = "gtmw"
+#         unique_together = ("device", "date")
+#         indexes = [
+#             models.Index(fields=["device", "date"]),
+#         ]
+
+#     def __str__(self):
+#         return f"{self.device} - {self.date}"

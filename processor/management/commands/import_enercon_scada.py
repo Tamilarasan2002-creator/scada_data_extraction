@@ -4,6 +4,7 @@ from django.core.management.base import BaseCommand
 from django.conf import settings
 from django.utils import timezone
 from django.db import connection
+from psycopg2.extras import execute_values
 
 
 class Command(BaseCommand):
@@ -29,7 +30,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR("❌ Folder not found"))
             return
 
-        batch_size = 5000
+        batch_size = 20000   # Increased for better performance
         chunk_size = 20000
         total_processed = 0
 
@@ -66,50 +67,40 @@ class Command(BaseCommand):
                         "temperature_outside_nacelle",
                     ]
 
-                    # Convert date format
+                    # Convert date format (vectorized)
                     chunk["date"] = pd.to_datetime(
                         chunk["date"],
                         format="%d-%m-%Y %H:%M:%S",
                         errors="coerce"
                     )
 
-                    chunk["date"] = chunk["date"].apply(
-                        lambda x: timezone.make_aware(x)
-                        if pd.notna(x) and timezone.is_naive(x)
-                        else x
-                    )
+                    # Drop invalid dates
+                    chunk = chunk.dropna(subset=["date"])
 
-                    records = []
-
-                    for _, row in chunk.iterrows():
-
-                        if pd.isna(row["date"]):
-                            continue
-
-                        records.append((
-                            row["date"],
-                            row["asset_name"],
-                            row["active_power_generation"],
-                            row["wind_direction_outside_nacelle"],
-                            row["wind_speed_outside_nacelle"],
-                            row["temperature_outside_nacelle"],
-                        ))
-
-                        if len(records) >= batch_size:
-                            self.bulk_upsert(records)
-                            total_processed += len(records)
-                            self.stdout.write(
-                                f"✅ Processed batch of {len(records)} rows"
-                            )
-                            records.clear()
-
-                    if records:
-                        self.bulk_upsert(records)
-                        total_processed += len(records)
-                        self.stdout.write(
-                            f"✅ Processed final batch of {len(records)} rows"
+                    # Make timezone aware (vectorized)
+                    if timezone.is_naive(chunk["date"].iloc[0]):
+                        chunk["date"] = chunk["date"].apply(
+                            lambda x: timezone.make_aware(x)
                         )
-                        records.clear()
+
+                    # Create records using vectorized zip (FAST)
+                    records = list(zip(
+                        chunk["date"],
+                        chunk["asset_name"],
+                        chunk["active_power_generation"],
+                        chunk["wind_direction_outside_nacelle"],
+                        chunk["wind_speed_outside_nacelle"],
+                        chunk["temperature_outside_nacelle"],
+                    ))
+
+                    # Process in batches
+                    for i in range(0, len(records), batch_size):
+                        batch = records[i:i + batch_size]
+                        self.bulk_upsert(batch)
+                        total_processed += len(batch)
+                        self.stdout.write(
+                            f"✅ Processed batch of {len(batch)} rows"
+                        )
 
                 self.stdout.write(
                     self.style.SUCCESS(f"🎯 Finished {file}")
@@ -132,7 +123,7 @@ class Command(BaseCommand):
             wind_speed_outside_nacelle,
             temperature_outside_nacelle
         )
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES %s
         ON CONFLICT (asset_name, date)
         DO UPDATE SET
             active_power_generation = EXCLUDED.active_power_generation,
@@ -142,4 +133,9 @@ class Command(BaseCommand):
         """
 
         with connection.cursor() as cursor:
-            cursor.executemany(query, records)
+            execute_values(
+                cursor,
+                query,
+                records,
+                page_size=5000
+            )

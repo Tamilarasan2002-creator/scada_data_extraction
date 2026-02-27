@@ -8,7 +8,7 @@ from psycopg2.extras import execute_values
 
 
 class Command(BaseCommand):
-    help = "Import GTMW 10-Minute Data (Fast UPSERT)"
+    help = "Import GTMW 10-Minute Data (Fast UPSERT with Quality)"
 
     def add_arguments(self, parser):
         parser.add_argument("folder_name", type=str)
@@ -47,23 +47,21 @@ class Command(BaseCommand):
                 try:
                     df = pd.read_excel(file_path)
 
-                    # Handle column variations safely
-                    if len(df.columns) == 7:
-                        # Device | Date | Quality | Misalignment | Active | Temp | Wind
-                        df = df.iloc[:, [0, 1, 3, 4, 5, 6]]
-
-                    elif len(df.columns) >= 6:
-                        df = df.iloc[:, :6]
-
-                    else:
+                    # Ensure minimum required columns
+                    if len(df.columns) < 7:
                         self.stdout.write(
-                            self.style.ERROR(f"❌ Skipping invalid format: {file}")
+                            self.style.ERROR(f"❌ Invalid format: {file}")
                         )
                         continue
+
+                    # Expected format:
+                    # Device | Time | Quality | Misalignment | Active | Temp | Wind
+                    df = df.iloc[:, :7]
 
                     df.columns = [
                         "device",
                         "time_only",
+                        "quality",
                         "misalignment_percent",
                         "avg_active_power",
                         "avg_ambient_temperature",
@@ -84,17 +82,29 @@ class Command(BaseCommand):
                             lambda x: timezone.make_aware(x)
                         )
 
-                    # Create records
+                    # Convert numeric columns safely
+                    numeric_cols = [
+                        "misalignment_percent",
+                        "avg_active_power",
+                        "avg_ambient_temperature",
+                        "avg_wind_speed",
+                    ]
+
+                    for col in numeric_cols:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+                    # Prepare records
                     records = list(zip(
                         df["device"],
                         df["date"],
+                        df["quality"],
                         df["misalignment_percent"],
                         df["avg_active_power"],
                         df["avg_ambient_temperature"],
                         df["avg_wind_speed"],
                     ))
 
-                    # Batch insert
+                    # Batch UPSERT
                     for i in range(0, len(records), batch_size):
                         batch = records[i:i + batch_size]
                         self.bulk_upsert(batch)
@@ -126,6 +136,7 @@ class Command(BaseCommand):
         INSERT INTO gtmw (
             device,
             date,
+            quality,
             misalignment_percent,
             avg_active_power,
             avg_ambient_temperature,
@@ -134,6 +145,7 @@ class Command(BaseCommand):
         VALUES %s
         ON CONFLICT (device, date)
         DO UPDATE SET
+            quality = EXCLUDED.quality,
             misalignment_percent = EXCLUDED.misalignment_percent,
             avg_active_power = EXCLUDED.avg_active_power,
             avg_ambient_temperature = EXCLUDED.avg_ambient_temperature,

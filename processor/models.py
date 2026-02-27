@@ -41,21 +41,45 @@ class ScadaDataEnercon(models.Model):
 
 
     
-# class GTMW(models.Model):
-#     device = models.CharField(max_length=100)
-#     date = models.DateTimeField()
+class GTMW(models.Model):
+    device = models.CharField(max_length=100)
+    date = models.DateTimeField()
+    quality = models.CharField(max_length=50, null=True, blank=True)  # ✅ NEW
+    misalignment_percent = models.FloatField(null=True, blank=True)
+    avg_active_power = models.FloatField(null=True, blank=True)
+    avg_ambient_temperature = models.FloatField(null=True, blank=True)
+    avg_wind_speed = models.FloatField(null=True, blank=True)
 
-#     misalignment_percent = models.FloatField(null=True, blank=True)
-#     avg_active_power = models.FloatField(null=True, blank=True)
-#     avg_ambient_temperature = models.FloatField(null=True, blank=True)
-#     avg_wind_speed = models.FloatField(null=True, blank=True)
+    class Meta:
+        db_table = "gtmw"
+        unique_together = ("device", "date")
+        indexes = [
+            models.Index(fields=["device", "date"]),
+        ]
 
-#     class Meta:
-#         db_table = "gtmw"
-#         unique_together = ("device", "date")
-#         indexes = [
-#             models.Index(fields=["device", "date"]),
-#         ]
+    def __str__(self):
+        return f"{self.device} - {self.date}"
 
-#     def __str__(self):
-#         return f"{self.device} - {self.date}"
+
+
+
+
+class InhouseSCADAData(models.Model):
+    timestamp = models.DateTimeField()
+    asset_name = models.CharField(max_length=50)
+
+    active_power_generation = models.FloatField(null=True, blank=True)
+    windspeed_outside_nacelle = models.FloatField(null=True, blank=True)
+    temperature_outside_nacelle = models.FloatField(null=True, blank=True)
+    winddirection_outside_nacelle = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        db_table = "inhouse_scada_data"
+        unique_together = ("timestamp", "asset_name")
+        indexes = [
+            models.Index(fields=["timestamp"]),
+            models.Index(fields=["asset_name"]),
+        ]
+
+    def __str__(self):
+        return f"{self.asset_name} - {self.timestamp}"

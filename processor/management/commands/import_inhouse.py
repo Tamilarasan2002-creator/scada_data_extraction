@@ -4,6 +4,7 @@ from django.core.management.base import BaseCommand
 from django.db import connection
 from django.conf import settings
 from psycopg2.extras import execute_values
+import numpy as np
 
 
 class Command(BaseCommand):
@@ -90,7 +91,7 @@ class Command(BaseCommand):
                         self.process_csv(os.path.join(folder_path, file))
 
     # --------------------------------------------------
-    # CORE PROCESSOR
+    # CORE PROCESSOR (FAST + NULL SAFE)
     # --------------------------------------------------
     def process_csv(self, file_path):
 
@@ -102,12 +103,9 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f"❌ CSV read failed: {e}"))
             return
 
-        # --------------------------------------------------
-        # NORMALIZE COLUMN NAMES
-        # --------------------------------------------------
+        # Normalize column names
         df.columns = df.columns.str.strip().str.lower()
 
-        # Mapping dictionary (case insensitive safe)
         column_map = {
             "date": "timestamp",
             "asset name": "asset_name",
@@ -120,12 +118,6 @@ class Command(BaseCommand):
         file_columns = set(df.columns)
         expected_columns = set(column_map.keys())
 
-        extra_columns = file_columns - expected_columns
-        if extra_columns:
-            self.stdout.write(
-                self.style.WARNING(f"⚠ Extra columns: {extra_columns}")
-            )
-
         missing_columns = expected_columns - file_columns
         if missing_columns:
             self.stdout.write(
@@ -133,12 +125,7 @@ class Command(BaseCommand):
             )
             return
 
-        # Rename
         df = df.rename(columns=column_map)
-
-        # --------------------------------------------------
-        # CLEAN DATA
-        # --------------------------------------------------
         df = df.dropna(how="all")
 
         df["timestamp"] = pd.to_datetime(
@@ -146,6 +133,7 @@ class Command(BaseCommand):
             format="%d-%m-%Y %H:%M:%S",
             errors="coerce"
         )
+
         df = df.dropna(subset=["timestamp", "asset_name"])
 
         if df.empty:
@@ -154,9 +142,23 @@ class Command(BaseCommand):
             )
             return
 
-        df = df.where(pd.notnull(df), None)
+        # Ensure correct order
+        df = df[
+            [
+                "timestamp",
+                "asset_name",
+                "active_power_generation",
+                "windspeed_outside_nacelle",
+                "temperature_outside_nacelle",
+                "winddirection_outside_nacelle",
+            ]
+        ]
 
-        records = list(df.itertuples(index=False, name=None))
+        # 🔥 Proper NULL handling
+        df = df.replace({np.nan: None})
+
+        # Faster conversion
+        records = df.values.tolist()
 
         insert_query = """
             INSERT INTO inhouse_scada_data (
@@ -178,7 +180,12 @@ class Command(BaseCommand):
 
         try:
             with connection.cursor() as cursor:
-                execute_values(cursor, insert_query, records, page_size=10000)
+                execute_values(
+                    cursor,
+                    insert_query,
+                    records,
+                    page_size=50000
+                )
 
             self.stdout.write(
                 self.style.SUCCESS(f"✅ Inserted/Updated {len(records)} rows")

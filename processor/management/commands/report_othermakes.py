@@ -31,7 +31,7 @@ class Command(BaseCommand):
         return pd.DataFrame(rows, columns=columns)
 
     # -----------------------------------------------------
-    # OPTIMIZED DATA FETCH (Daily or Year)
+    # MERGED DATA FETCH (UNION ALL)
     # -----------------------------------------------------
     def fetch_all_data(self, report_date=None, report_year=None):
 
@@ -42,69 +42,73 @@ class Command(BaseCommand):
             start_dt = f"{report_date} 00:00:00"
             end_dt = f"{report_date} 23:59:59"
 
-        master_index = pd.date_range(start=start_dt, end=end_dt, freq='10min')
+        master_index = pd.date_range(start=start_dt, end=end_dt, freq="10min")
 
-        tables = [
-            {
-                "name": "inhouse_scada_data",
-                "date_col": "timestamp",
-                "asset_col": "asset_name",
-                "active_power": "active_power_generation",
-                "wind_speed": "windspeed_outside_nacelle",
-                "temp": "temperature_outside_nacelle",
-                "wind_dir": "winddirection_outside_nacelle"
-            },
-            {
-                "name": "gtmw",
-                "date_col": "date",
-                "asset_col": "device",
-                "active_power": "avg_active_power",
-                "wind_speed": "avg_wind_speed",
-                "temp": "avg_ambient_temperature",
-                "wind_dir": "NULL"
-            },
-            {
-                "name": "scada_data_enercon",
-                "date_col": "date",
-                "asset_col": "asset_name",
-                "active_power": "active_power_generation",
-                "wind_speed": "wind_speed_outside_nacelle",
-                "temp": "temperature_outside_nacelle",
-                "wind_dir": "wind_direction_outside_nacelle"
-            },
-        ]
+        query = """
+            SELECT
+                datetime,
+                TRIM(UPPER(asset_name)) AS locno_key,
+                active_power_generation,
+                windspeed_outside_nacelle,
+                temperature_outside_nacelle,
+                winddirection_outside_nacelle
+            FROM (
+
+                SELECT
+                    timestamp AS datetime,
+                    asset_name,
+                    active_power_generation,
+                    windspeed_outside_nacelle,
+                    temperature_outside_nacelle,
+                    winddirection_outside_nacelle
+                FROM inhouse_scada_data
+
+                UNION ALL
+
+                SELECT
+                    date AS datetime,
+                    device AS asset_name,
+                    avg_active_power AS active_power_generation,
+                    avg_wind_speed AS windspeed_outside_nacelle,
+                    avg_ambient_temperature AS temperature_outside_nacelle,
+                    misalignment_percent AS winddirection_outside_nacelle
+                FROM gtmw
+
+                UNION ALL
+
+                SELECT
+                    date AS datetime,
+                    asset_name,
+                    active_power_generation,
+                    wind_speed_outside_nacelle AS windspeed_outside_nacelle,
+                    temperature_outside_nacelle,
+                    wind_direction_outside_nacelle AS winddirection_outside_nacelle
+                FROM scada_data_enercon
+
+            ) combined
+            WHERE datetime BETWEEN %s AND %s
+        """
+
+        df = self.fetch_data(query, [start_dt, end_dt])
+
+        if df.empty:
+            return {}, master_index
+
+        df["datetime"] = pd.to_datetime(df["datetime"])
 
         data_map = {}
 
-        for table in tables:
-            query = f"""
-                SELECT TRIM(UPPER({table['asset_col']})) as locno_key,
-                       {table['date_col']} as datetime,
-                       {table['active_power']} as active_power_generation,
-                       {table['wind_speed']} as windspeed_outside_nacelle,
-                       {table['temp']} as temperature_outside_nacelle,
-                       {table['wind_dir']} as winddirection_outside_nacelle
-                FROM {table['name']}
-                WHERE {table['date_col']} BETWEEN %s AND %s
-            """
+        for locno, group in df.groupby("locno_key"):
 
-            try:
-                df = self.fetch_data(query, [start_dt, end_dt])
-                if not df.empty:
-                    df["datetime"] = pd.to_datetime(df["datetime"])
+            group = group.sort_values("datetime").set_index("datetime")
 
-                    for locno, group in df.groupby("locno_key"):
-                        group = (
-                            group.drop(columns=["locno_key"])
-                            .sort_values("datetime")
-                            .set_index("datetime")
-                        )
-                        group = group[~group.index.duplicated(keep='first')]
-                        data_map[locno] = group
+            # Remove duplicate timestamps
+            group = group[~group.index.duplicated(keep="first")]
 
-            except Exception as e:
-                self.stdout.write(f"⚠ Table {table['name']} fetch error: {str(e)}")
-                continue
+            # Align with master 10-min index
+            group = group.reindex(master_index)
+
+            data_map[locno] = group
 
         return data_map, master_index
 
@@ -116,9 +120,6 @@ class Command(BaseCommand):
         report_date = kwargs.get("date")
         report_year = kwargs.get("year")
 
-        # -------------------------
-        # Decide Mode
-        # -------------------------
         if report_year:
             self.stdout.write(f"🚀 Generating FULL YEAR Report for {report_year}")
             all_data_map, global_time_index = self.fetch_all_data(
@@ -127,7 +128,7 @@ class Command(BaseCommand):
             report_label = str(report_year)
         else:
             if not report_date:
-                report_date = datetime.now().strftime('%Y-%m-%d')
+                report_date = datetime.now().strftime("%Y-%m-%d")
 
             self.stdout.write(f"🚀 Generating Daily Report for {report_date}")
             all_data_map, global_time_index = self.fetch_all_data(
@@ -135,9 +136,9 @@ class Command(BaseCommand):
             )
             report_label = report_date
 
-        # -------------------------
-        # Fetch API Machines
-        # -------------------------
+        # -----------------------------------------------------
+        # FETCH API MACHINE LIST
+        # -----------------------------------------------------
         self.stdout.write("🚀 Fetching API Machine List...")
         try:
             response = requests.get(API_URL, timeout=10)
@@ -156,24 +157,17 @@ class Command(BaseCommand):
             "locno": ["Loc No"],
             "mac": ["Mac No"],
             "param": ["Parameters"],
-            "unit": ["Units"]
+            "unit": ["Units"],
         }
 
         machine_dataframes = []
-        machine_no = 0
+        machine_no = 1
 
         structure = [
             ("temperature_outside_nacelle", "outdoor_temp", "°C"),
             ("windspeed_outside_nacelle", "wind_speed", "m/s"),
             ("winddirection_outside_nacelle", "wind_direction", "degree"),
         ]
-        # Testing
-        # structure = [
-        #     ("temperature_outside_nacelle", "Ambient Temp at 70.5 mtr", "°C"),
-        #     ("active_power_generation", "Active_Power 70.5 mtr", ""),
-        #     ("windspeed_outside_nacelle", "Wind Speed at 78.5 mtr", "m/s"),
-        #     ("winddirection_outside_nacelle", "Wind Direction at 78.5 mtr", "degree"),
-        # ]
 
         for item in api_data:
             locno = item.get("locno")
@@ -181,11 +175,10 @@ class Command(BaseCommand):
             lon = item.get("longitude")
 
             locno_upper = locno.strip().upper()
-            df = all_data_map.get(locno_upper, pd.DataFrame())
 
-            if not df.empty:
-                df = df.reindex(global_time_index)
-            else:
+            df = all_data_map.get(locno_upper)
+
+            if df is None:
                 df = pd.DataFrame(index=global_time_index)
 
             machine_label = f"M_{machine_no}"
@@ -202,7 +195,7 @@ class Command(BaseCommand):
                     machine_dataframes.append(df[col])
                 else:
                     machine_dataframes.append(
-                        pd.Series([None] * len(df), index=df.index)
+                        pd.Series([None] * len(global_time_index), index=global_time_index)
                     )
 
             machine_no += 1
@@ -212,6 +205,7 @@ class Command(BaseCommand):
             return
 
         self.stdout.write("📊 Finalizing report structure...")
+
         final_data_df = pd.concat(machine_dataframes, axis=1)
 
         full_report = [
@@ -220,32 +214,42 @@ class Command(BaseCommand):
             headers["locno"],
             headers["mac"],
             headers["param"],
-            headers["unit"]
+            headers["unit"],
         ]
 
-        time_stamps = global_time_index.strftime('%Y-%m-%d %H:%M:%S').tolist()
+        time_stamps = global_time_index.strftime("%Y-%m-%d %H:%M:%S").tolist()
         data_values = final_data_df.values.tolist()
 
         for i, row in enumerate(data_values):
             full_report.append([time_stamps[i]] + row)
 
-        # -------------------------
-        # SAVE TO make_reports FOLDER
-        # -------------------------
+        # -----------------------------------------------------
+        # SAVE REPORT
+        # -----------------------------------------------------
         base_reports_dir = os.path.join(settings.BASE_DIR, "make_reports")
         os.makedirs(base_reports_dir, exist_ok=True)
 
         if report_year:
-            yearly_dir = os.path.join(base_reports_dir, "yearly_reports", str(report_year))
+            yearly_dir = os.path.join(
+                base_reports_dir, "yearly_reports", str(report_year)
+            )
             os.makedirs(yearly_dir, exist_ok=True)
-            file_path = os.path.join(yearly_dir, f"scada_report_{report_year}.csv")
+            file_path = os.path.join(
+                yearly_dir, f"scada_report_{report_year}.csv"
+            )
         else:
-            daily_dir = os.path.join(base_reports_dir, "daily_reports", report_label)
+            daily_dir = os.path.join(
+                base_reports_dir, "daily_reports", report_label
+            )
             os.makedirs(daily_dir, exist_ok=True)
-            file_path = os.path.join(daily_dir, f"scada_report_{report_label}.csv")
+            file_path = os.path.join(
+                daily_dir, f"scada_report_{report_label}.csv"
+            )
 
         pd.DataFrame(full_report).to_csv(file_path, index=False, header=False)
 
-        self.stdout.write(self.style.SUCCESS(
-            f"\n✅ Report Generated Successfully\n📁 {file_path}\n"
-        ))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"\n✅ Report Generated Successfully\n📁 {file_path}\n"
+            )
+        )

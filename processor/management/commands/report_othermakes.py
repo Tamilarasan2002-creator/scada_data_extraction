@@ -11,13 +11,17 @@ API_URL = "http://172.16.7.118:8003/api/obs/leaplocs.php"
 
 
 class Command(BaseCommand):
-    help = "Generate SCADA Report (Include All LocNo Even If No Data)"
-
-    def add_arguments(self, parser):
-        parser.add_argument("--date", type=str, help="Filter by date YYYY-MM-DD")
+    help = "Generate SCADA Report (Daily or Full Year - Single File)"
 
     # -----------------------------------------------------
-    # SAFE DATABASE FETCH (No Pandas Warning)
+    # ARGUMENTS
+    # -----------------------------------------------------
+    def add_arguments(self, parser):
+        parser.add_argument("--date", type=str, help="Filter by date YYYY-MM-DD")
+        parser.add_argument("--year", type=int, help="Generate full year report YYYY")
+
+    # -----------------------------------------------------
+    # SAFE DATABASE FETCH
     # -----------------------------------------------------
     def fetch_data(self, query, params):
         with connection.cursor() as cursor:
@@ -27,19 +31,23 @@ class Command(BaseCommand):
         return pd.DataFrame(rows, columns=columns)
 
     # -----------------------------------------------------
-    # OPTIMIZED BATCH FETCH
+    # OPTIMIZED DATA FETCH (Daily or Year)
     # -----------------------------------------------------
-    def fetch_all_data(self, report_date):
-        if not report_date:
-            return {}, None
+    def fetch_all_data(self, report_date=None, report_year=None):
 
-        start_dt = f"{report_date} 00:00:00"
-        end_dt = f"{report_date} 23:59:59"
+        if report_year:
+            start_dt = f"{report_year}-01-01 00:00:00"
+            end_dt = f"{report_year}-12-31 23:59:59"
+        else:
+            start_dt = f"{report_date} 00:00:00"
+            end_dt = f"{report_date} 23:59:59"
+
+        master_index = pd.date_range(start=start_dt, end=end_dt, freq='10min')
 
         tables = [
             {
-                "name": "inhouse_scada_data", 
-                "date_col": "timestamp", 
+                "name": "inhouse_scada_data",
+                "date_col": "timestamp",
                 "asset_col": "asset_name",
                 "active_power": "active_power_generation",
                 "wind_speed": "windspeed_outside_nacelle",
@@ -47,17 +55,17 @@ class Command(BaseCommand):
                 "wind_dir": "winddirection_outside_nacelle"
             },
             {
-                "name": "gtmw", 
-                "date_col": "date", 
+                "name": "gtmw",
+                "date_col": "date",
                 "asset_col": "device",
                 "active_power": "avg_active_power",
                 "wind_speed": "avg_wind_speed",
                 "temp": "avg_ambient_temperature",
-                "wind_dir": "NULL" 
+                "wind_dir": "NULL"
             },
             {
-                "name": "scada_data_enercon", 
-                "date_col": "date", 
+                "name": "scada_data_enercon",
+                "date_col": "date",
                 "asset_col": "asset_name",
                 "active_power": "active_power_generation",
                 "wind_speed": "wind_speed_outside_nacelle",
@@ -66,9 +74,7 @@ class Command(BaseCommand):
             },
         ]
 
-        # Final map: locno -> dataframe
         data_map = {}
-        all_timestamps = []
 
         for table in tables:
             query = f"""
@@ -81,26 +87,25 @@ class Command(BaseCommand):
                 FROM {table['name']}
                 WHERE {table['date_col']} BETWEEN %s AND %s
             """
+
             try:
                 df = self.fetch_data(query, [start_dt, end_dt])
                 if not df.empty:
                     df["datetime"] = pd.to_datetime(df["datetime"])
-                    all_timestamps.extend(df["datetime"].unique())
-                    
-                    # Group by locno to avoid repeated filtering
+
                     for locno, group in df.groupby("locno_key"):
-                        if locno not in data_map:
-                            group = group.drop(columns=["locno_key"]).sort_values("datetime").set_index("datetime")
-                            # Remove duplicates if any
-                            group = group[~group.index.duplicated(keep='first')]
-                            data_map[locno] = group
+                        group = (
+                            group.drop(columns=["locno_key"])
+                            .sort_values("datetime")
+                            .set_index("datetime")
+                        )
+                        group = group[~group.index.duplicated(keep='first')]
+                        data_map[locno] = group
+
             except Exception as e:
                 self.stdout.write(f"⚠ Table {table['name']} fetch error: {str(e)}")
                 continue
 
-        # Create a full time index for the day (144 intervals of 10-min)
-        master_index = pd.date_range(start=start_dt, end=end_dt, freq='10min')
-        
         return data_map, master_index
 
     # -----------------------------------------------------
@@ -109,14 +114,30 @@ class Command(BaseCommand):
     def handle(self, *args, **kwargs):
 
         report_date = kwargs.get("date")
-        if not report_date:
-            report_date = datetime.now().strftime('%Y-%m-%d')
+        report_year = kwargs.get("year")
 
-        self.stdout.write(f"🚀 Initializing optimization for {report_date}...")
-        
-        # Batch fetch all data once
-        all_data_map, global_time_index = self.fetch_all_data(report_date)
+        # -------------------------
+        # Decide Mode
+        # -------------------------
+        if report_year:
+            self.stdout.write(f"🚀 Generating FULL YEAR Report for {report_year}")
+            all_data_map, global_time_index = self.fetch_all_data(
+                report_year=report_year
+            )
+            report_label = str(report_year)
+        else:
+            if not report_date:
+                report_date = datetime.now().strftime('%Y-%m-%d')
 
+            self.stdout.write(f"🚀 Generating Daily Report for {report_date}")
+            all_data_map, global_time_index = self.fetch_all_data(
+                report_date=report_date
+            )
+            report_label = report_date
+
+        # -------------------------
+        # Fetch API Machines
+        # -------------------------
         self.stdout.write("🚀 Fetching API Machine List...")
         try:
             response = requests.get(API_URL, timeout=10)
@@ -129,7 +150,6 @@ class Command(BaseCommand):
             self.stdout.write("❌ No API data")
             return
 
-        # Prepare headers
         headers = {
             "lat": ["DateTime / Latitude"],
             "lon": ["Longitude"],
@@ -140,29 +160,29 @@ class Command(BaseCommand):
         }
 
         machine_dataframes = []
-        machine_no = 1
+        machine_no = 0
 
         structure = [
-            ("windspeed_outside_nacelle", "Wind Speed at 78.5 mtr", "m/s"),
-            ("winddirection_outside_nacelle", "Wind Direction at 78.5 mtr", "degree"),
-            ("temperature_outside_nacelle", "Ambient Temp at 78.5 mtr", "°C"),
-            ("active_power_generation", "Active_Power 78.5 mtr", ""),
+            ("temperature_outside_nacelle", "outdoor_temp", "°C"),
+            ("windspeed_outside_nacelle", "wind_speed", "m/s"),
+            ("winddirection_outside_nacelle", "wind_direction", "degree"),
         ]
+        # Testing
+        # structure = [
+        #     ("temperature_outside_nacelle", "Ambient Temp at 70.5 mtr", "°C"),
+        #     ("active_power_generation", "Active_Power 70.5 mtr", ""),
+        #     ("windspeed_outside_nacelle", "Wind Speed at 78.5 mtr", "m/s"),
+        #     ("winddirection_outside_nacelle", "Wind Direction at 78.5 mtr", "degree"),
+        # ]
 
-        # -------------------------------------------------
-        # LOOP ALL LOCNO (Pre-fetched data lookup)
-        # -------------------------------------------------
         for item in api_data:
             locno = item.get("locno")
             lat = item.get("latitude")
             lon = item.get("longitude")
-            
+
             locno_upper = locno.strip().upper()
-            
-            # Lookup in our pre-fetched map
             df = all_data_map.get(locno_upper, pd.DataFrame())
 
-            # Reindex to master time index to ensure alignment
             if not df.empty:
                 df = df.reindex(global_time_index)
             else:
@@ -181,7 +201,9 @@ class Command(BaseCommand):
                 if col in df.columns:
                     machine_dataframes.append(df[col])
                 else:
-                    machine_dataframes.append(pd.Series([None]*len(df), index=df.index, name=col))
+                    machine_dataframes.append(
+                        pd.Series([None] * len(df), index=df.index)
+                    )
 
             machine_no += 1
 
@@ -189,13 +211,9 @@ class Command(BaseCommand):
             self.stdout.write("❌ No data structures built")
             return
 
-        # -------------------------------------------------
-        # CONCAT ALL AT ONCE (Prevents fragmentation)
-        # -------------------------------------------------
         self.stdout.write("📊 Finalizing report structure...")
         final_data_df = pd.concat(machine_dataframes, axis=1)
-        
-        # Build report rows
+
         full_report = [
             headers["lat"],
             headers["lon"],
@@ -205,27 +223,29 @@ class Command(BaseCommand):
             headers["unit"]
         ]
 
-        # Convert data rows (values.tolist() is much faster than iterrows)
-        # We need to prepend the index (timestamp) to each row
         time_stamps = global_time_index.strftime('%Y-%m-%d %H:%M:%S').tolist()
         data_values = final_data_df.values.tolist()
-        
+
         for i, row in enumerate(data_values):
             full_report.append([time_stamps[i]] + row)
 
-        # -------------------------------------------------
-        # SAVE FILE
-        # -------------------------------------------------
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        folder_name = f"scada_report_{timestamp_str}"
-        reports_dir = os.path.join(settings.BASE_DIR, "reports")
-        os.makedirs(reports_dir, exist_ok=True)
-        output_folder = os.path.join(reports_dir, folder_name)
-        os.makedirs(output_folder, exist_ok=True)
-        file_path = os.path.join(output_folder, f"{folder_name}.csv")
+        # -------------------------
+        # SAVE TO make_reports FOLDER
+        # -------------------------
+        base_reports_dir = os.path.join(settings.BASE_DIR, "make_reports")
+        os.makedirs(base_reports_dir, exist_ok=True)
+
+        if report_year:
+            yearly_dir = os.path.join(base_reports_dir, "yearly_reports", str(report_year))
+            os.makedirs(yearly_dir, exist_ok=True)
+            file_path = os.path.join(yearly_dir, f"scada_report_{report_year}.csv")
+        else:
+            daily_dir = os.path.join(base_reports_dir, "daily_reports", report_label)
+            os.makedirs(daily_dir, exist_ok=True)
+            file_path = os.path.join(daily_dir, f"scada_report_{report_label}.csv")
 
         pd.DataFrame(full_report).to_csv(file_path, index=False, header=False)
 
         self.stdout.write(self.style.SUCCESS(
-            f"\n✅ Optimized Report Generated Successfully\n📁 {file_path}\n"
+            f"\n✅ Report Generated Successfully\n📁 {file_path}\n"
         ))
